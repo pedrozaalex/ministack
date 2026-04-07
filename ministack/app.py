@@ -465,29 +465,38 @@ async def app(scope, receive, send):
             }
             try:
                 _status, _hdrs, _raw = await _lam._invoke(func_name, event, headers)
-                # Parse the Lambda's API Gateway v2 response format
-                # {"statusCode": 200, "headers": {...}, "body": "..."}
+                _hdrs = dict(_hdrs) if _hdrs else {}
                 if isinstance(_raw, bytes):
-                    _raw = _raw.decode("utf-8", errors="replace")
-                try:
-                    _parsed = json.loads(_raw) if isinstance(_raw, str) else _raw
-                except (json.JSONDecodeError, TypeError):
-                    _parsed = _raw
-                if isinstance(_parsed, dict) and "statusCode" in _parsed:
-                    status_code = _parsed["statusCode"]
-                    resp_headers = dict(_parsed.get("headers") or {})
-                    resp_body = (_parsed.get("body") or "").encode("utf-8")
+                    _raw_str = _raw.decode("utf-8", errors="replace")
                 else:
-                    status_code = _status
-                    resp_headers = dict(_hdrs) if _hdrs else {}
-                    resp_body = _raw.encode("utf-8") if isinstance(_raw, str) else (_raw or b"")
+                    _raw_str = _raw or ""
+
+                # Check if the Lambda errored (unhandled exception)
+                if _hdrs.get("X-Amz-Function-Error"):
+                    # Return 502 with the error body as-is
+                    status_code = 502
+                    resp_headers = {"Content-Type": "application/json"}
+                    resp_body = _raw_str.encode("utf-8")
+                else:
+                    # Parse the Lambda's API Gateway v2 response format
+                    # {"statusCode": 200, "headers": {...}, "body": "..."}
+                    try:
+                        _parsed = json.loads(_raw_str)
+                    except (json.JSONDecodeError, TypeError):
+                        _parsed = _raw_str
+                    if isinstance(_parsed, dict) and "statusCode" in _parsed:
+                        status_code = _parsed["statusCode"]
+                        resp_headers = dict(_parsed.get("headers") or {})
+                        body_val = _parsed.get("body") or ""
+                        resp_body = body_val.encode("utf-8") if isinstance(body_val, str) else body_val
+                    else:
+                        # Not API Gateway v2 format — return as-is
+                        status_code = _status
+                        resp_headers = {"Content-Type": "application/json"}
+                        resp_body = _raw_str.encode("utf-8")
             except Exception as e:
                 logger.exception("Error in Lambda Function URL dispatch: %s", e)
                 status_code, resp_headers, resp_body = 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
-            # Strip Lambda invoke metadata headers — not part of Function URL response
-            resp_headers.pop("X-Amz-Log-Result", None)
-            resp_headers.pop("X-Amz-Function-Error", None)
-            resp_headers.pop("X-Amz-Executed-Version", None)
             resp_headers.update({
                 "Access-Control-Allow-Origin": "*",
                 "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, HEAD, OPTIONS, PATCH",

@@ -53,6 +53,7 @@ REGION = os.environ.get("MINISTACK_REGION", os.environ.get("AWS_DEFAULT_REGION",
 LAMBDA_EXECUTOR = os.environ.get("LAMBDA_EXECUTOR", "local").lower()
 LAMBDA_DOCKER_VOLUME_MOUNT = os.environ.get("LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT", "")
 LAMBDA_DOCKER_NETWORK = os.environ.get("LAMBDA_DOCKER_NETWORK", "")
+LAMBDA_DOCKER_FLAGS = os.environ.get("LAMBDA_DOCKER_FLAGS", "")
 
 try:
     docker_lib: Any = importlib.import_module("docker")
@@ -779,6 +780,7 @@ def _delete_function(name: str, query_params: dict):
     else:
         del _functions[name]
         invalidate_worker(name)
+        invalidate_rie_container(name)
     return 204, {}, b""
 
 
@@ -814,8 +816,9 @@ def _update_code(name: str, data: dict):
     func["config"]["LastUpdateStatus"] = "Successful"
     func["config"]["RevisionId"] = new_uuid()
 
-    # Invalidate warm worker so next invocation picks up the new code
+    # Invalidate warm worker/container so next invocation picks up the new code
     invalidate_worker(name)
+    invalidate_rie_container(name)
 
     if data.get("Publish"):
         ver_num = func["next_version"]
@@ -981,6 +984,201 @@ def _docker_image_for_runtime(runtime: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Warm container pool for RIE-based runtimes (dotnet, provided)
+# ---------------------------------------------------------------------------
+
+import threading as _threading
+
+_rie_containers: dict[str, dict] = {}  # func_name -> {"container": Container, "ip": str}
+_rie_lock = _threading.Lock()
+
+
+def invalidate_rie_container(func_name: str):
+    """Stop and remove warm RIE container when function is updated or deleted."""
+    with _rie_lock:
+        entry = _rie_containers.pop(func_name, None)
+    if entry:
+        try:
+            entry["container"].stop(timeout=2)
+        except Exception:
+            pass
+        try:
+            entry["container"].remove(force=True)
+        except Exception:
+            pass
+
+
+def _execute_rie_warm(func: dict, event: dict, config: dict, code_dir: str,
+                      code_zip: bytes, image: str, handler: str,
+                      container_env: dict, timeout: int,
+                      is_provided: bool, is_dotnet: bool, client) -> dict:
+    """Execute via RIE with a warm container pool.
+
+    On first invocation, creates the container, copies code, starts it, and
+    waits for the RIE to be ready. Subsequent invocations reuse the same
+    container — no cold start.
+    """
+    import urllib.request
+    import time as _time
+    import tarfile
+    import io
+
+    func_name = config["FunctionName"]
+    net_name = LAMBDA_DOCKER_NETWORK or "bridge"
+
+    # Check for existing warm container
+    with _rie_lock:
+        entry = _rie_containers.get(func_name)
+
+    if entry:
+        # Verify container is still running
+        try:
+            entry["container"].reload()
+            if entry["container"].status != "running":
+                entry = None
+                with _rie_lock:
+                    _rie_containers.pop(func_name, None)
+        except Exception:
+            entry = None
+            with _rie_lock:
+                _rie_containers.pop(func_name, None)
+
+    if not entry:
+        # Cold start — create and start the container
+        if is_provided:
+            bootstrap_path = os.path.join(code_dir, "bootstrap")
+            if os.path.exists(bootstrap_path):
+                os.chmod(bootstrap_path, 0o755)
+            cmd = [handler] if handler else ["bootstrap"]
+        else:
+            cmd = [handler]
+
+        create_kwargs: dict = {
+            "image": image,
+            "command": cmd,
+            "environment": container_env,
+            "detach": True,
+        }
+        if LAMBDA_DOCKER_NETWORK:
+            create_kwargs["network"] = LAMBDA_DOCKER_NETWORK
+
+        # Parse LAMBDA_DOCKER_FLAGS
+        extra_hosts: dict[str, str] = {}
+        if LAMBDA_DOCKER_FLAGS:
+            for flag in LAMBDA_DOCKER_FLAGS.split():
+                if flag.startswith("--add-host="):
+                    host_entry = flag[len("--add-host="):]
+                    if ":" in host_entry:
+                        h, ip = host_entry.split(":", 1)
+                        extra_hosts[h] = ip
+
+        # Add DNS entries for Function URL hostnames
+        try:
+            import socket
+            my_ip = socket.gethostbyname(socket.gethostname())
+        except Exception:
+            my_ip = "172.17.0.2"
+        extra_hosts["localhost.localstack.cloud"] = my_ip
+        for _fn_cfg in _function_urls.values():
+            _fn_url = _fn_cfg.get("FunctionUrl", "")
+            if "localhost.localstack.cloud" in _fn_url:
+                from urllib.parse import urlparse as _urlparse
+                _fn_host = _urlparse(_fn_url).hostname
+                if _fn_host:
+                    extra_hosts[_fn_host] = my_ip
+
+        if extra_hosts:
+            create_kwargs["extra_hosts"] = extra_hosts
+
+        container = client.containers.create(**create_kwargs)
+
+        # Copy code into the container
+        tar_buf = io.BytesIO()
+        with tarfile.open(fileobj=tar_buf, mode="w") as tar:
+            for root, dirs, files in os.walk(code_dir):
+                for f in files:
+                    fp = os.path.join(root, f)
+                    arcname = os.path.relpath(fp, code_dir)
+                    info = tarfile.TarInfo(name=arcname)
+                    info.size = os.path.getsize(fp)
+                    info.mode = 0o755 if f == "bootstrap" else 0o644
+                    with open(fp, "rb") as fh:
+                        tar.addfile(info, fh)
+        tar_buf.seek(0)
+        container.put_archive("/var/task", tar_buf)
+
+        if is_provided:
+            bootstrap_src = os.path.join(code_dir, "bootstrap")
+            if os.path.exists(bootstrap_src):
+                rt_buf = io.BytesIO()
+                with tarfile.open(fileobj=rt_buf, mode="w") as tar:
+                    info = tarfile.TarInfo(name="bootstrap")
+                    info.size = os.path.getsize(bootstrap_src)
+                    info.mode = 0o755
+                    with open(bootstrap_src, "rb") as fh:
+                        tar.addfile(info, fh)
+                rt_buf.seek(0)
+                container.put_archive("/var/runtime", rt_buf)
+
+        container.start()
+
+        # Wait for RIE to be ready
+        ip = ""
+        for _attempt in range(int(timeout * 2) + 10):
+            _time.sleep(0.5)
+            container.reload()
+            if container.status != "running":
+                stdout = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
+                return {"body": {"errorMessage": f"Container exited during startup: {stdout[:500]}", "errorType": "Runtime.ExitError"}, "error": True, "log": stdout}
+            nets = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+            ip = nets.get(net_name, {}).get("IPAddress", "")
+            if not ip:
+                continue
+            try:
+                # Test if RIE is ready by making a dummy request
+                test_url = f"http://{ip}:8080/2015-03-31/functions/function/invocations"
+                req = urllib.request.Request(test_url, data=b'{}',
+                                            headers={"Content-Type": "application/json"})
+                urllib.request.urlopen(req, timeout=5)
+                break  # RIE is ready
+            except (urllib.error.URLError, ConnectionRefusedError, OSError):
+                continue
+        else:
+            stdout = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
+            try:
+                container.stop(timeout=2)
+                container.remove(force=True)
+            except Exception:
+                pass
+            return {"body": {"errorMessage": f"RIE did not start: {stdout[:500]}", "errorType": "Runtime.ExitError"}, "error": True, "log": stdout}
+
+        # Store in warm pool
+        with _rie_lock:
+            _rie_containers[func_name] = {"container": container, "ip": ip}
+        entry = _rie_containers[func_name]
+        logger.info("Warm RIE container started for %s at %s:8080", func_name, ip)
+
+    # Invoke the warm container
+    ip = entry["ip"]
+    rie_url = f"http://{ip}:8080/2015-03-31/functions/function/invocations"
+    try:
+        req = urllib.request.Request(rie_url, data=json.dumps(event).encode(),
+                                    headers={"Content-Type": "application/json"})
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        body = resp.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError:
+            parsed = body
+        logs = entry["container"].logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
+        return {"body": parsed, "log": logs}
+    except Exception as exc:
+        # Container might have died — invalidate and retry once
+        invalidate_rie_container(func_name)
+        return {"body": {"errorMessage": f"RIE invocation failed: {exc}", "errorType": "Runtime.InvokeError"}, "error": True}
+
+
+# ---------------------------------------------------------------------------
 # Function execution – Docker mode
 # ---------------------------------------------------------------------------
 
@@ -1111,107 +1309,12 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
                 ef.write(json.dumps(event))
 
             if is_provided or is_dotnet:
-                # RIE-based execution for provided and dotnet runtimes.
-                # provided: user supplies bootstrap; RIE is the image entrypoint.
-                # dotnet: image has built-in RIE; handler is passed as CMD.
-                # Both listen on port 8080; we POST the event and read the response.
-                # We use the container's bridge IP (not host port mapping) since
-                # ministack itself may run inside a Docker container.
-                # We use put_archive() instead of volume mounts to avoid
-                # Docker-in-Docker path resolution issues.
-                import urllib.request
-                import time as _time
-                import tarfile
-                import io
-
-                if is_provided:
-                    bootstrap_path = os.path.join(code_dir, "bootstrap")
-                    if os.path.exists(bootstrap_path):
-                        os.chmod(bootstrap_path, 0o755)
-                    cmd = [handler] if handler else ["bootstrap"]
-                else:
-                    cmd = [handler]
-
-                net_name = LAMBDA_DOCKER_NETWORK or "bridge"
-                create_kwargs: dict = {
-                    "image": image,
-                    "command": cmd,
-                    "environment": container_env,
-                    "detach": True,
-                }
-                if LAMBDA_DOCKER_NETWORK:
-                    create_kwargs["network"] = LAMBDA_DOCKER_NETWORK
-
-                container = client.containers.create(**create_kwargs)
-
-                # Copy code into the container via tar archive
-                tar_buf = io.BytesIO()
-                with tarfile.open(fileobj=tar_buf, mode="w") as tar:
-                    for root, dirs, files in os.walk(code_dir):
-                        for f in files:
-                            fp = os.path.join(root, f)
-                            arcname = os.path.relpath(fp, code_dir)
-                            info = tarfile.TarInfo(name=arcname)
-                            info.size = os.path.getsize(fp)
-                            info.mode = 0o755 if f == "bootstrap" else 0o644
-                            with open(fp, "rb") as fh:
-                                tar.addfile(info, fh)
-                tar_buf.seek(0)
-                container.put_archive("/var/task", tar_buf)
-
-                # For provided runtimes, also copy bootstrap to /var/runtime/
-                if is_provided:
-                    bootstrap_src = os.path.join(code_dir, "bootstrap")
-                    if os.path.exists(bootstrap_src):
-                        rt_buf = io.BytesIO()
-                        with tarfile.open(fileobj=rt_buf, mode="w") as tar:
-                            info = tarfile.TarInfo(name="bootstrap")
-                            info.size = os.path.getsize(bootstrap_src)
-                            info.mode = 0o755
-                            with open(bootstrap_src, "rb") as fh:
-                                tar.addfile(info, fh)
-                        rt_buf.seek(0)
-                        container.put_archive("/var/runtime", rt_buf)
-
-                container.start()
-                try:
-                    max_attempts = int(timeout * 2) + 10
-                    for _attempt in range(max_attempts):
-                        _time.sleep(0.5)
-                        container.reload()
-                        if container.status != "running":
-                            break
-                        # Get container IP on the bridge network
-                        nets = container.attrs.get("NetworkSettings", {}).get("Networks", {})
-                        ip = nets.get(net_name, {}).get("IPAddress", "")
-                        if not ip:
-                            continue
-                        try:
-                            rie_url = f"http://{ip}:8080/2015-03-31/functions/function/invocations"
-                            req = urllib.request.Request(rie_url, data=json.dumps(event).encode(),
-                                                        headers={"Content-Type": "application/json"})
-                            resp = urllib.request.urlopen(req, timeout=timeout)
-                            body = resp.read().decode("utf-8", errors="replace")
-                            try:
-                                parsed = json.loads(body)
-                            except json.JSONDecodeError:
-                                parsed = body
-                            logs = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
-                            return {"body": parsed, "log": logs}
-                        except (urllib.error.URLError, ConnectionRefusedError, OSError):
-                            continue
-                    runtime_label = "dotnet" if is_dotnet else "provided"
-                    stdout = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
-                    return {"body": {"errorMessage": f"{runtime_label} runtime failed: {stdout[:500]}", "errorType": "Runtime.ExitError"}, "error": True, "log": stdout}
-                finally:
-                    try:
-                        container.stop(timeout=2)
-                    except Exception:
-                        pass
-                    try:
-                        container.remove(force=True)
-                    except Exception:
-                        pass
+                # RIE-based execution with warm container pool.
+                # Containers stay alive between invocations — only cold start on first call.
+                # invalidate_rie_container() is called on function delete/update.
+                return _execute_rie_warm(func, event, config, code_dir, code_zip,
+                                        image, handler, container_env, timeout,
+                                        is_provided, is_dotnet, client)
             elif is_node:
                 wrapper_path = os.path.join(code_dir, "_wrapper.js")
                 with open(wrapper_path, "w") as wf:
