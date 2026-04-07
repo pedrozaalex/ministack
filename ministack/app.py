@@ -28,6 +28,10 @@ _MINISTACK_PORT = os.environ.get("GATEWAY_PORT", "4566")
 _EXECUTE_API_RE = re.compile(
     r"^([a-f0-9]{8})\.execute-api\." + re.escape(_MINISTACK_HOST) + r"(?::\d+)?$"
 )
+# Matches Lambda Function URL hosts: "{uuid}.lambda-url.{region}.<host>:{port}"
+_LAMBDA_URL_RE = re.compile(
+    r"^([0-9a-f-]+)\.lambda-url\.[a-z0-9-]+\." + re.escape(_MINISTACK_HOST) + r"(?::\d+)?$"
+)
 # Matches virtual-hosted S3:
 #   "{bucket}.<host>" or "{bucket}.<host>:4566"          (boto3/SDK default)
 #   "{bucket}.s3.<host>" or "{bucket}.s3.<host>:4566"    (Terraform AWS provider v4+)
@@ -35,7 +39,7 @@ _EXECUTE_API_RE = re.compile(
 _S3_VHOST_RE = re.compile(
     r"^([^.]+)(?:\.s3)?\." + re.escape(_MINISTACK_HOST) + r"(?::\d+)?$"
 )
-_S3_VHOST_EXCLUDE_RE = re.compile(r"\.(execute-api|alb|emr|efs|elasticache|s3-control)\.")
+_S3_VHOST_EXCLUDE_RE = re.compile(r"\.(execute-api|lambda-url|alb|emr|efs|elasticache|s3-control)\.")
 
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
 from ministack.core.router import detect_service, extract_account_id, extract_region
@@ -427,6 +431,76 @@ async def app(scope, receive, send):
         })
         await _send_response(send, status, resp_headers, resp_body)
         return
+
+    # Lambda Function URL: host = {uuid}.lambda-url.{region}.localhost:{port}
+    _lambda_url_match = _LAMBDA_URL_RE.match(host)
+    if _lambda_url_match:
+        from ministack.services import lambda_svc as _lam
+        url_id = _lambda_url_match.group(1)
+        # Find the function that owns this URL ID
+        func_name = None
+        for fn, cfg in _lam._function_urls.items():
+            if url_id in cfg.get("FunctionUrl", ""):
+                func_name = fn
+                break
+        if func_name:
+            # Build a Lambda API Gateway v2-style event
+            event = {
+                "version": "2.0",
+                "routeKey": "$default",
+                "rawPath": path,
+                "rawQueryString": "&".join(f"{k}={v}" for k, v in query_params.items()) if query_params else "",
+                "headers": dict(headers),
+                "queryStringParameters": dict(query_params) if query_params else None,
+                "requestContext": {
+                    "http": {
+                        "method": method,
+                        "path": path,
+                        "sourceIp": "127.0.0.1",
+                    },
+                    "requestId": request_id,
+                },
+                "body": body.decode("utf-8", errors="replace") if body else None,
+                "isBase64Encoded": False,
+            }
+            try:
+                _status, _hdrs, _raw = await _lam._invoke(func_name, event, headers)
+                # Parse the Lambda's API Gateway v2 response format
+                # {"statusCode": 200, "headers": {...}, "body": "..."}
+                if isinstance(_raw, bytes):
+                    _raw = _raw.decode("utf-8", errors="replace")
+                try:
+                    _parsed = json.loads(_raw) if isinstance(_raw, str) else _raw
+                except (json.JSONDecodeError, TypeError):
+                    _parsed = _raw
+                if isinstance(_parsed, dict) and "statusCode" in _parsed:
+                    status_code = _parsed["statusCode"]
+                    resp_headers = dict(_parsed.get("headers") or {})
+                    resp_body = (_parsed.get("body") or "").encode("utf-8")
+                else:
+                    status_code = _status
+                    resp_headers = dict(_hdrs) if _hdrs else {}
+                    resp_body = _raw.encode("utf-8") if isinstance(_raw, str) else (_raw or b"")
+            except Exception as e:
+                logger.exception("Error in Lambda Function URL dispatch: %s", e)
+                status_code, resp_headers, resp_body = 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
+            # Strip Lambda invoke metadata headers — not part of Function URL response
+            resp_headers.pop("X-Amz-Log-Result", None)
+            resp_headers.pop("X-Amz-Function-Error", None)
+            resp_headers.pop("X-Amz-Executed-Version", None)
+            resp_headers.update({
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, HEAD, OPTIONS, PATCH",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Expose-Headers": "*",
+                "x-amzn-requestid": request_id,
+            })
+            await _send_response(send, status_code, resp_headers, resp_body)
+            return
+        else:
+            await _send_response(send, 404, {"Content-Type": "application/json"},
+                                 json.dumps({"message": "Function URL not found"}).encode())
+            return
 
     # ALB data-plane — two addressing modes:
     #   1. Host header matches a configured ALB DNS name or {lb-name}.alb.localhost

@@ -957,6 +957,9 @@ _RUNTIME_IMAGE_MAP: dict[str, str] = {
     "provided.al2023": "public.ecr.aws/lambda/provided:al2023",
     "provided.al2": "public.ecr.aws/lambda/provided:al2",
     "provided": "public.ecr.aws/lambda/provided:al2023",
+    "dotnet6": "public.ecr.aws/lambda/dotnet:6",
+    "dotnet7": "public.ecr.aws/lambda/dotnet:7",
+    "dotnet8": "public.ecr.aws/lambda/dotnet:8",
 }
 
 
@@ -971,6 +974,9 @@ def _docker_image_for_runtime(runtime: str) -> str | None:
         return f"node:{ver}-slim"
     if runtime.startswith("provided"):
         return "public.ecr.aws/lambda/provided:al2023"
+    if runtime.startswith("dotnet"):
+        ver = runtime.replace("dotnet", "")
+        return f"public.ecr.aws/lambda/dotnet:{ver}"
     return None
 
 
@@ -1010,7 +1016,8 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
 
     is_provided = runtime.startswith("provided")
     is_node = runtime.startswith("nodejs")
-    if not runtime.startswith("python") and not is_node and not is_provided:
+    is_dotnet = runtime.startswith("dotnet")
+    if not runtime.startswith("python") and not is_node and not is_provided and not is_dotnet:
         return {
             "body": {
                 "statusCode": 200,
@@ -1051,7 +1058,7 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
                         lzf.extractall(layer_dir)
                     layers_dirs.append(layer_dir)
 
-            if not is_provided:
+            if not is_provided and not is_dotnet:
                 if "." not in handler:
                     return {"body": {"errorMessage": f"Invalid handler format: {handler}", "errorType": "Runtime.InvalidEntrypoint"}, "error": True}
                 module_name, func_name = handler.rsplit(".", 1)
@@ -1084,7 +1091,7 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
                 "_LAMBDA_TIMEOUT": str(timeout),
                 "_LAMBDA_LAYERS_DIRS": ":".join(container_layer_dirs),
             }
-            if not is_provided:
+            if not is_provided and not is_dotnet:
                 container_env["_LAMBDA_HANDLER_MODULE"] = module_name
                 container_env["_LAMBDA_HANDLER_FUNC"] = func_name
             else:
@@ -1103,39 +1110,84 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
             with open(event_file, "w") as ef:
                 ef.write(json.dumps(event))
 
-            if is_provided:
-                # provided runtimes: use AWS Lambda RIE built into the provided image.
-                # Make bootstrap executable, start container with RIE, POST event via HTTP.
-                bootstrap_path = os.path.join(code_dir, "bootstrap")
-                if os.path.exists(bootstrap_path):
-                    os.chmod(bootstrap_path, 0o755)
-                # provided runtimes use the AWS Lambda RIE built into the base image.
-                # RIE listens on port 8080; we POST the event and read the response.
+            if is_provided or is_dotnet:
+                # RIE-based execution for provided and dotnet runtimes.
+                # provided: user supplies bootstrap; RIE is the image entrypoint.
+                # dotnet: image has built-in RIE; handler is passed as CMD.
+                # Both listen on port 8080; we POST the event and read the response.
+                # We use the container's bridge IP (not host port mapping) since
+                # ministack itself may run inside a Docker container.
+                # We use put_archive() instead of volume mounts to avoid
+                # Docker-in-Docker path resolution issues.
                 import urllib.request
-                bootstrap_path = os.path.join(code_dir, "bootstrap")
-                if os.path.exists(bootstrap_path):
-                    os.chmod(bootstrap_path, 0o755)
-                run_kwargs: dict = {
-                    "image": image, "command": ["/var/task/bootstrap"],
-                    "environment": container_env, "volumes": volumes,
-                    "ports": {"8080/tcp": None}, "detach": True, "stdin_open": False,
+                import time as _time
+                import tarfile
+                import io
+
+                if is_provided:
+                    bootstrap_path = os.path.join(code_dir, "bootstrap")
+                    if os.path.exists(bootstrap_path):
+                        os.chmod(bootstrap_path, 0o755)
+                    cmd = [handler] if handler else ["bootstrap"]
+                else:
+                    cmd = [handler]
+
+                net_name = LAMBDA_DOCKER_NETWORK or "bridge"
+                create_kwargs: dict = {
+                    "image": image,
+                    "command": cmd,
+                    "environment": container_env,
+                    "detach": True,
                 }
                 if LAMBDA_DOCKER_NETWORK:
-                    run_kwargs["network"] = LAMBDA_DOCKER_NETWORK
-                container = client.containers.run(**run_kwargs)
+                    create_kwargs["network"] = LAMBDA_DOCKER_NETWORK
+
+                container = client.containers.create(**create_kwargs)
+
+                # Copy code into the container via tar archive
+                tar_buf = io.BytesIO()
+                with tarfile.open(fileobj=tar_buf, mode="w") as tar:
+                    for root, dirs, files in os.walk(code_dir):
+                        for f in files:
+                            fp = os.path.join(root, f)
+                            arcname = os.path.relpath(fp, code_dir)
+                            info = tarfile.TarInfo(name=arcname)
+                            info.size = os.path.getsize(fp)
+                            info.mode = 0o755 if f == "bootstrap" else 0o644
+                            with open(fp, "rb") as fh:
+                                tar.addfile(info, fh)
+                tar_buf.seek(0)
+                container.put_archive("/var/task", tar_buf)
+
+                # For provided runtimes, also copy bootstrap to /var/runtime/
+                if is_provided:
+                    bootstrap_src = os.path.join(code_dir, "bootstrap")
+                    if os.path.exists(bootstrap_src):
+                        rt_buf = io.BytesIO()
+                        with tarfile.open(fileobj=rt_buf, mode="w") as tar:
+                            info = tarfile.TarInfo(name="bootstrap")
+                            info.size = os.path.getsize(bootstrap_src)
+                            info.mode = 0o755
+                            with open(bootstrap_src, "rb") as fh:
+                                tar.addfile(info, fh)
+                        rt_buf.seek(0)
+                        container.put_archive("/var/runtime", rt_buf)
+
+                container.start()
                 try:
-                    import time as _time
-                    for _attempt in range(30):
+                    max_attempts = int(timeout * 2) + 10
+                    for _attempt in range(max_attempts):
                         _time.sleep(0.5)
                         container.reload()
                         if container.status != "running":
                             break
+                        # Get container IP on the bridge network
+                        nets = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+                        ip = nets.get(net_name, {}).get("IPAddress", "")
+                        if not ip:
+                            continue
                         try:
-                            ports = container.ports.get("8080/tcp") or []
-                            if not ports:
-                                continue
-                            host_port = ports[0]["HostPort"]
-                            rie_url = f"http://127.0.0.1:{host_port}/2015-03-31/functions/function/invocations"
+                            rie_url = f"http://{ip}:8080/2015-03-31/functions/function/invocations"
                             req = urllib.request.Request(rie_url, data=json.dumps(event).encode(),
                                                         headers={"Content-Type": "application/json"})
                             resp = urllib.request.urlopen(req, timeout=timeout)
@@ -1148,8 +1200,9 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
                             return {"body": parsed, "log": logs}
                         except (urllib.error.URLError, ConnectionRefusedError, OSError):
                             continue
+                    runtime_label = "dotnet" if is_dotnet else "provided"
                     stdout = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
-                    return {"body": {"errorMessage": f"provided runtime failed: {stdout[:500]}", "errorType": "Runtime.ExitError"}, "error": True, "log": stdout}
+                    return {"body": {"errorMessage": f"{runtime_label} runtime failed: {stdout[:500]}", "errorType": "Runtime.ExitError"}, "error": True, "log": stdout}
                 finally:
                     try:
                         container.stop(timeout=2)
@@ -1244,6 +1297,11 @@ def _execute_function(func: dict, event: dict) -> dict:
     if runtime.startswith("python") or runtime.startswith("nodejs"):
         return _execute_function_warm(func, event)
 
+    if runtime.startswith("dotnet"):
+        if not _docker_available:
+            return {"body": {"errorMessage": "Docker is required for .NET Lambda functions. Install Docker and mount /var/run/docker.sock.", "errorType": "Runtime.DockerUnavailable"}, "error": True}
+        return _execute_function_docker(func, event)
+
     if LAMBDA_EXECUTOR == "docker":
         return _execute_function_docker(func, event)
     return _execute_function_local(func, event)
@@ -1335,9 +1393,9 @@ def _execute_function_image(func: dict, event: dict) -> dict:
     run_kwargs = {
         "image": image_uri,
         "environment": container_env,
-        "ports": {"8080/tcp": None},
         "detach": True,
     }
+    net_name = LAMBDA_DOCKER_NETWORK or "bridge"
     if LAMBDA_DOCKER_NETWORK:
         run_kwargs["network"] = LAMBDA_DOCKER_NETWORK
 
@@ -1351,11 +1409,11 @@ def _execute_function_image(func: dict, event: dict) -> dict:
             if container.status != "running":
                 break
             try:
-                ports = container.ports.get("8080/tcp") or []
-                if not ports:
+                nets = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+                ip = nets.get(net_name, {}).get("IPAddress", "")
+                if not ip:
                     continue
-                host_port = ports[0]["HostPort"]
-                rie_url = f"http://127.0.0.1:{host_port}/2015-03-31/functions/function/invocations"
+                rie_url = f"http://{ip}:8080/2015-03-31/functions/function/invocations"
                 req = urllib.request.Request(rie_url, data=json.dumps(event).encode(),
                                             headers={"Content-Type": "application/json"})
                 resp = urllib.request.urlopen(req, timeout=timeout)
@@ -2721,7 +2779,7 @@ def _create_function_url_config(func_name: str, data: dict, qualifier: str | Non
             "ResourceConflictException", f"Function URL config already exists for {func_name}", 409
         )
     cfg = {
-        "FunctionUrl": f"https://{new_uuid()}.lambda-url.{REGION}.on.aws/",
+        "FunctionUrl": f"http://{new_uuid()}.lambda-url.{REGION}.localhost.localstack.cloud:4566/",
         "FunctionArn": _func_arn(func_name),
         "AuthType": data.get("AuthType", "NONE"),
         "Cors": data.get("Cors", {}),
