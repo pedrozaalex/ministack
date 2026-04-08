@@ -986,7 +986,12 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
     ``{"body": ..., "log": ..., "error": ...}``.
     """
     if not _docker_available:
-        logger.warning("docker SDK unavailable – falling back to local subprocess executor")
+        
+        if runtime.startswith("python") or runtime.startswith("nodejs"):
+            logger.warning("docker SDK unavailable - falling back to warm executor (node/py detected)")
+            return _execute_function_warm(func, event)
+
+        logger.warning("docker SDK unavailable - falling back to local subprocess executor")
         return _execute_function_local(func, event)
 
     config = func.get("config") or func
@@ -1241,11 +1246,12 @@ def _execute_function(func: dict, event: dict) -> dict:
 
     runtime = config.get("Runtime", "python3.9")
 
+    if LAMBDA_EXECUTOR == "docker":
+        return _execute_function_docker(func, event)
+
     if runtime.startswith("python") or runtime.startswith("nodejs"):
         return _execute_function_warm(func, event)
 
-    if LAMBDA_EXECUTOR == "docker":
-        return _execute_function_docker(func, event)
     return _execute_function_local(func, event)
 
 
